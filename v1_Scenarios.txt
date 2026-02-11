@@ -1,0 +1,1619 @@
+
+ 4.1 Field-Level Validations 
+
+|  Code  	  |  Field  			|  Rule  												|  Error Message  					|
+
+|  Reject 01  | NDC 				| Must be present 										| NDC MISSING 						|
+|  Reject 01  | NDC 				| Must be exactly 11 numeric digits 					| NDC INVALID FORMAT 				|
+|  Reject 02  | Procedure Code  	| Must be present 										| PROCEDURE CODE MISSING 			|
+|  Reject 02  | Procedure Code 		| Must be exactly 5 alphanumeric characters 			| PROCEDURE CODE INVALID FORMAT 	|
+|  Reject 03  | NOC Indicator 		| If present, must be "Y" (or blank) 					| NOC INDICATOR UNKNOWN VALUE 		|
+|  Reject 04  | Effective Date 		| Must be present 										| EFFECTIVE DATE MISSING 			|
+|  Reject 04  | Effective Date 		| Must be valid date in mm/dd/yyyy format 				| EFFECTIVE DATE INVALID FORMAT		|
+|  Reject 05  | Ineffective Date 	| If present, must be valid date in mm/dd/yyyy format 	| INEFFECTIVE DATE INVALID FORMAT 	|
+
+ 4.2 Business Rule Validations 
+
+Reject 11     | No duplicate records in same file (same key) 			| DUPLICATE RECORDS 							|
+Reject 13/14  | No overlapping date ranges for same NDC-Procedure 		| CURRENT RECORD OVERLAPS WITH PREVIOUS RECORD 	|
+(No Code)  	  | Cannot update record that already has ineffective date 	| ATTEMPT TO UPDATE CLOSED RECORD 				|
+Warning 15    | New ineffective < existing effective, no overlap 		| RETRO RECORD 									|
+
+
+ CATEGORY A: SUCCESSFUL INSERT SCENARIOS
+
+ Scenario A1: Simple New Mapping
+ 
+Description: First time mapping for NDC-Procedure combination
+CSV Record:
+  NDC: "12345678901"
+  REIMB_CODE: "J0135"
+  IS_NOC:  ""
+  ADD_DATE: "01/15/2026"
+  RMV_DATE: ""
+
+Existing MMIS Records:  NONE
+
+Validation:    PASS
+
+Action: INSERT new record
+
+Database After:
+  - NDC: "12345678901"
+    Procedure_Code: "J0135"
+    NOC_Indicator: NULL
+    Effective_Date: 2026-01-15
+    Ineffective_Date: NULL
+    User_ID: "BATCH_LOADER"
+    DLU: 2026-01-21 10:30:00
+ 
+
+---
+
+ Scenario A2: New Mapping with NOC Indicator 
+ yaml
+Description: New mapping flagged as "Not Otherwise Classified"
+CSV Record:
+  NDC: "23456789012"
+  REIMB_CODE: "J3490"
+  IS_NOC:  "Y"
+  ADD_DATE: "02/01/2026"
+  RMV_DATE: ""
+
+Existing MMIS Records: NONE
+
+Validation:   PASS
+
+Action: INSERT new record
+
+Database After:
+  - NDC: "23456789012"
+    Procedure_Code: "J3490"
+    NOC_Indicator: "Y"
+    Effective_Date: 2026-02-01
+    Ineffective_Date: NULL
+ 
+
+---
+
+ Scenario A3: New Mapping with Pre-Set End Date 
+ yaml
+Description: Time-limited mapping with known end date
+CSV Record:
+  NDC: "34567890123"
+  REIMB_CODE: "J1100"
+  IS_NOC:  ""
+  ADD_DATE: "03/01/2026"
+  RMV_DATE: "12/31/2026"
+
+Existing MMIS Records: NONE
+
+Validation:   PASS
+
+Action:  INSERT new record
+
+Database After: 
+  - NDC: "34567890123"
+    Procedure_Code: "J1100"
+    Effective_Date: 2026-03-01
+    Ineffective_Date: 2026-12-31
+    
+Business Meaning: This mapping is only valid from March 1 to December 31, 2026
+ 
+
+---
+
+Scenario A4: Multiple Sequential Mappings (Timeline) 
+ yaml
+Description: Creating historical timeline for same NDC-Procedure
+CSV Records (in file):
+  Record 1:
+    NDC:  "45678901234"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/01/2025"
+    RMV_DATE: "06/30/2025"
+  
+  Record 2:
+    NDC: "45678901234"
+    REIMB_CODE:  "J0135"
+    ADD_DATE: "07/01/2025"
+    RMV_DATE: "12/31/2025"
+  
+  Record 3:
+    NDC: "45678901234"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/01/2026"
+    RMV_DATE: ""
+
+Existing MMIS Records:  NONE
+
+Validation:   PASS (no overlaps, proper sequence)
+
+Processing Order:  Record 1 → Record 2 → Record 3 (oldest first per Rule 3)
+
+Action: INSERT all 3 records
+
+Database After: 
+  - Record 1: Eff:  2025-01-01, Ineff: 2025-06-30
+  - Record 2: Eff: 2025-07-01, Ineff: 2025-12-31
+  - Record 3: Eff:  2026-01-01, Ineff: NULL
+
+Business Meaning: Complete history showing mapping changes over time
+ 
+
+---
+
+Scenario A5: Same NDC, Different Procedure Codes 
+ yaml
+Description: One NDC can map to multiple procedure codes simultaneously
+CSV Records:
+  Record 1:
+    NDC: "56789012345"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/15/2026"
+  
+  Record 2:
+    NDC: "56789012345"
+    REIMB_CODE: "J0180"
+    ADD_DATE: "01/15/2026"
+
+Existing MMIS Records:  NONE
+
+Validation:   PASS (different procedure codes = different combinations)
+
+Action: INSERT both records
+
+Database After:
+  - NDC: "56789012345", Proc: "J0135", Eff: 2026-01-15
+  - NDC: "56789012345", Proc:  "J0180", Eff: 2026-01-15
+
+Business Meaning: Same drug can be billed under different procedure codes
+ 
+
+---
+
+Scenario A6: Different NDCs, Same Procedure Code 
+ yaml
+Description: Multiple drugs map to same procedure code
+CSV Records: 
+  Record 1:
+    NDC: "11111111111"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/15/2026"
+  
+  Record 2:
+    NDC: "22222222222"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/15/2026"
+
+Existing MMIS Records: NONE
+
+Validation:   PASS
+
+Action: INSERT both records
+
+Database After:
+  - NDC: "11111111111", Proc:  "J0135", Eff: 2026-01-15
+  - NDC: "22222222222", Proc: "J0135", Eff:  2026-01-15
+
+Business Meaning: Multiple NDCs (e.g., different manufacturers) use same billing code
+ 
+
+---
+
+CATEGORY B: SUCCESSFUL UPDATE SCENARIOS 
+
+Scenario B1: Close Open Mapping (Add End Date) 
+  
+Description: Adding ineffective date to previously open-ended mapping
+CSV Record:
+  NDC: "67890123456"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/15/2026"
+  RMV_DATE: "06/30/2026"
+
+Existing MMIS Record:
+  NDC: "67890123456"
+  Procedure_Code: "J0135"
+  Effective_Date:  2026-01-15
+  Ineffective_Date: NULL
+
+Validation:   PASS
+
+Action: UPDATE existing record, set Ineffective_Date = 2026-06-30
+
+Database After:
+  - NDC: "67890123456"
+    Procedure_Code: "J0135"
+    Effective_Date: 2026-01-15
+    Ineffective_Date: 2026-06-30  ← UPDATED
+    DLU: 2026-01-21 10:30:00  ← UPDATED
+
+Business Meaning: Mapping no longer valid after June 30, 2026
+ 
+
+---
+
+Scenario B2: Update NOC Indicator Only 
+  
+Description: Adding NOC flag to existing mapping
+CSV Record: 
+  NDC: "78901234567"
+  REIMB_CODE: "J3490"
+  IS_NOC: "Y"
+  ADD_DATE: "02/01/2026"
+  RMV_DATE: ""
+
+Existing MMIS Record: 
+  NDC: "78901234567"
+  Procedure_Code: "J3490"
+  NOC_Indicator: NULL
+  Effective_Date: 2026-02-01
+  Ineffective_Date: NULL
+
+Validation:   PASS
+
+Action: UPDATE existing record, set NOC_Indicator = "Y"
+
+Database After:
+  - NOC_Indicator: "Y"  ← UPDATED
+    DLU: 2026-01-21 10:30:00  ← UPDATED
+
+Business Meaning:  Procedure code now designated as "Not Otherwise Classified"
+ 
+
+---
+
+Scenario B3: Update Both NOC and Ineffective Date 
+  
+Description: Simultaneous update of multiple fields
+CSV Record:
+  NDC: "89012345678"
+  REIMB_CODE:  "J3490"
+  IS_NOC: "Y"
+  ADD_DATE: "03/01/2026"
+  RMV_DATE: "09/30/2026"
+
+Existing MMIS Record:
+  NDC: "89012345678"
+  Procedure_Code:  "J3490"
+  NOC_Indicator: NULL
+  Effective_Date: 2026-03-01
+  Ineffective_Date: NULL
+
+Validation:   PASS
+
+Action: UPDATE NOC_Indicator = "Y" AND Ineffective_Date = 2026-09-30
+
+Database After:
+  - NOC_Indicator: "Y"  ← UPDATED
+    Ineffective_Date: 2026-09-30  ← UPDATED
+    DLU: 2026-01-21 10:30:00  ← UPDATED
+ 
+
+---
+
+Scenario B4: No Change Update (Idempotent) 
+  
+Description: CSV record matches existing MMIS record exactly
+CSV Record:
+  NDC: "11122233344"
+  REIMB_CODE: "J0135"
+  IS_NOC: ""
+  ADD_DATE: "01/01/2026"
+  RMV_DATE: "06/30/2026"
+
+Existing MMIS Record:
+  NDC: "11122233344"
+  Procedure_Code:  "J0135"
+  NOC_Indicator: NULL
+  Effective_Date: 2026-01-01
+  Ineffective_Date: 2026-06-30
+
+Validation:   PASS
+
+Action: No update needed (values match)
+
+Database After: No changes
+
+Business Meaning: Re-processing same file is safe (idempotent operation)
+ 
+
+---
+
+##  CATEGORY C: WARNING SCENARIOS (Process with Alert) 
+
+Scenario C1: Retroactive Record (Warning 15) 
+  
+Description: Adding historical record that ends before existing record begins
+CSV Record:
+  NDC: "33344455566"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/01/2025"
+  RMV_DATE: "06/30/2025"
+
+Existing MMIS Record:
+  NDC: "33344455566"
+  Procedure_Code: "J0135"
+  Effective_Date: 2026-01-01
+  Ineffective_Date: NULL
+
+Validation:   PASS with WARNING
+Warning Code: Warning 15
+Warning Message: "RETRO RECORD"
+
+Reason: New ineffective (06/30/2025) < Existing effective (01/01/2026), no overlap
+
+Action: INSERT new record AND log warning
+
+Database After:
+  - Record 1: Eff: 2025-01-01, Ineff: 2025-06-30  ← NEW
+  - Record 2: Eff: 2026-01-01, Ineff: NULL  ← EXISTING
+
+Warning Log:
+  "WARNING 15 - RETRO RECORD:  NDC 33344455566, Proc J0135, Eff 01/01/2025"
+  "Gap exists: 2025-07-01 to 2025-12-31"
+
+Business Meaning: Historical data correction; gap in coverage exists
+ 
+
+---
+
+Scenario C2: Future Effective Date (Information Only) 
+  
+Description: Mapping scheduled for future activation
+CSV Record:
+  NDC: "44455566677"
+  REIMB_CODE: "J2250"
+  ADD_DATE: "07/01/2026"
+  RMV_DATE: ""
+
+Current Date: 2026-01-21
+
+Existing MMIS Records: NONE
+
+Validation:   PASS (no rule against future dates)
+
+Action: INSERT record
+
+Database After:
+  - Effective_Date: 2026-07-01  (future date)
+    Ineffective_Date: NULL
+
+Business Meaning: Pre-scheduled mapping for upcoming drug approval
+Note: Claims before 07/01/2026 will not find this mapping
+ 
+
+---
+
+##  CATEGORY D: FIELD VALIDATION ERRORS 
+
+Scenario D1: NDC Missing (Reject 01) 
+  
+CSV Record:
+  NDC: ""  ← BLANK
+  REIMB_CODE:  "J0135"
+  ADD_DATE: "01/15/2026"
+
+Validation:   FAIL
+Error Code:  Reject 01
+Error Message: "NDC MISSING"
+
+Action:  REJECT record, log exception
+
+Exception Log:
+  "Reject 01 - NDC MISSING for REIMB_CODE J0135, ADD_DATE 01/15/2026"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D2: NDC Too Short (Reject 01) 
+  
+CSV Record:
+  NDC: "123456789"  ← Only 9 digits
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/15/2026"
+
+Validation:   FAIL
+Error Code: Reject 01
+Error Message: "NDC INVALID FORMAT"
+
+Exception Log:
+  "Reject 01 - NDC INVALID FORMAT:  '123456789' (expected 11 digits)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D3: NDC Too Long (Reject 01) 
+  
+CSV Record:
+  NDC: "123456789012"  ← 12 digits
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/15/2026"
+
+Validation:   FAIL
+Error Code:  Reject 01
+Error Message:  "NDC INVALID FORMAT"
+
+Exception Log:
+  "Reject 01 - NDC INVALID FORMAT: '123456789012' (expected 11 digits)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D4: NDC Contains Letters (Reject 01) 
+  
+CSV Record:
+  NDC: "1234567890A"  ← Contains letter
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/15/2026"
+
+Validation:   FAIL
+Error Code:  Reject 01
+Error Message: "NDC INVALID FORMAT"
+
+Exception Log:
+  "Reject 01 - NDC INVALID FORMAT: '1234567890A' (must be numeric)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D5: NDC Contains Special Characters (Reject 01) 
+  
+CSV Record:
+  NDC: "12345-67890"  ← Contains hyphen
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/15/2026"
+
+Validation:    FAIL
+Error Code: Reject 01
+Error Message: "NDC INVALID FORMAT"
+
+Exception Log:
+  "Reject 01 - NDC INVALID FORMAT: '12345-67890' (must be numeric, no hyphens)"
+
+Result: Record NOT processed
+
+Note: Some systems use formatted NDCs like "12345-678-90" - these must be cleaned to "12345678900"
+ 
+
+---
+
+Scenario D6: Procedure Code Missing (Reject 02) 
+  
+CSV Record:
+  NDC: "22222222222"
+  REIMB_CODE: ""  ← BLANK
+  ADD_DATE: "01/15/2026"
+
+Validation:   FAIL
+Error Code:  Reject 02
+Error Message:  "PROCEDURE CODE MISSING"
+
+Exception Log:
+  "Reject 02 - PROCEDURE CODE MISSING for NDC 22222222222"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D7: Procedure Code Too Short (Reject 02) 
+  
+CSV Record:
+  NDC: "33333333333"
+  REIMB_CODE: "J01"  ← Only 3 characters
+  ADD_DATE:  "01/15/2026"
+
+Validation:   FAIL
+Error Code: Reject 02
+Error Message: "PROCEDURE CODE INVALID FORMAT"
+
+Exception Log:
+  "Reject 02 - PROCEDURE CODE INVALID FORMAT: 'J01' (expected 5 characters)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D8: Procedure Code Too Long (Reject 02) 
+  
+CSV Record:
+  NDC: "44444444444"
+  REIMB_CODE: "J01350"  ← 6 characters
+  ADD_DATE:  "01/15/2026"
+
+Validation:   FAIL
+Error Code: Reject 02
+Error Message: "PROCEDURE CODE INVALID FORMAT"
+
+Exception Log:
+  "Reject 02 - PROCEDURE CODE INVALID FORMAT: 'J01350' (expected 5 characters)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D9: Procedure Code with Special Characters (Reject 02) 
+  
+CSV Record:
+  NDC: "55555555555"
+  REIMB_CODE: "J01@5"  ← Contains '@'
+  ADD_DATE: "01/15/2026"
+
+Validation:   FAIL
+Error Code: Reject 02
+Error Message: "PROCEDURE CODE INVALID FORMAT"
+
+Exception Log: 
+  "Reject 02 - PROCEDURE CODE INVALID FORMAT: 'J01@5' (alphanumeric only)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D10: NOC Indicator Invalid Value (Reject 03) 
+  
+CSV Record:
+  NDC: "66666666666"
+  REIMB_CODE: "J3490"
+  IS_NOC: "N"  ← Invalid (only Y or blank allowed)
+  ADD_DATE: "01/15/2026"
+
+Validation:   FAIL
+Error Code: Reject 03
+Error Message: "NOC INDICATOR UNKNOWN VALUE"
+
+Exception Log:
+  "Reject 03 - NOC INDICATOR UNKNOWN VALUE: 'N' (expected blank or 'Y')"
+
+Result: Record NOT processed
+
+Note: BRD mentions DDE has wrong logic (uses "N" instead of "Y")
+ 
+
+---
+
+Scenario D11: NOC Indicator Random Value (Reject 03) 
+  
+CSV Record:
+  NDC: "77777777777"
+  REIMB_CODE: "J3490"
+  IS_NOC: "X"  ← Invalid
+  ADD_DATE: "01/15/2026"
+
+Validation:   FAIL
+Error Code: Reject 03
+Error Message: "NOC INDICATOR UNKNOWN VALUE"
+
+Exception Log:
+  "Reject 03 - NOC INDICATOR UNKNOWN VALUE: 'X' (expected blank or 'Y')"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D12: Effective Date Missing (Reject 04) 
+  
+CSV Record:
+  NDC: "88888888888"
+  REIMB_CODE:  "J0135"
+  ADD_DATE: ""  ← BLANK
+
+Validation:    FAIL
+Error Code: Reject 04
+Error Message: "EFFECTIVE DATE MISSING"
+
+Exception Log:
+  "Reject 04 - EFFECTIVE DATE MISSING for NDC 88888888888, Proc J0135"
+
+Result:  Record NOT processed
+ 
+
+---
+
+Scenario D13: Effective Date Wrong Format - ISO Format (Reject 04) 
+  
+CSV Record:
+  NDC: "99999999999"
+  REIMB_CODE:  "J0135"
+  ADD_DATE: "2026-01-15"  ← Wrong format (should be mm/dd/yyyy)
+
+Validation:   FAIL
+Error Code: Reject 04
+Error Message: "EFFECTIVE DATE INVALID FORMAT"
+
+Exception Log: 
+  "Reject 04 - EFFECTIVE DATE INVALID FORMAT: '2026-01-15' (expected mm/dd/yyyy)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D14: Effective Date Wrong Format - Slashes Reversed (Reject 04) 
+  
+CSV Record:
+  NDC: "10101010101"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "15/01/2026"  ← dd/mm/yyyy instead of mm/dd/yyyy
+
+Validation:   FAIL
+Error Code: Reject 04
+Error Message: "EFFECTIVE DATE INVALID FORMAT"
+
+Exception Log: 
+  "Reject 04 - EFFECTIVE DATE INVALID FORMAT:  '15/01/2026' (expected mm/dd/yyyy)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D15: Effective Date Invalid - February 30 (Reject 04) 
+  
+CSV Record:
+  NDC: "20202020202"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "02/30/2026"  ← Not a valid date
+
+Validation:   FAIL
+Error Code:  Reject 04
+Error Message: "EFFECTIVE DATE INVALID FORMAT"
+
+Exception Log:
+  "Reject 04 - EFFECTIVE DATE INVALID FORMAT: '02/30/2026' (not a valid date)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D16: Effective Date Invalid - Month 13 (Reject 04) 
+  
+CSV Record:
+  NDC: "30303030303"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "13/01/2026"  ← Month > 12
+
+Validation:   FAIL
+Error Code: Reject 04
+Error Message: "EFFECTIVE DATE INVALID FORMAT"
+
+Exception Log:
+  "Reject 04 - EFFECTIVE DATE INVALID FORMAT: '13/01/2026' (invalid month)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D17: Ineffective Date Wrong Format (Reject 05) 
+  
+CSV Record:
+  NDC: "40404040404"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/15/2026"
+  RMV_DATE: "2026-06-30"  ← Wrong format
+
+Validation:   FAIL
+Error Code: Reject 05
+Error Message: "INEFFECTIVE DATE INVALID FORMAT"
+
+Exception Log:
+  "Reject 05 - INEFFECTIVE DATE INVALID FORMAT: '2026-06-30' (expected mm/dd/yyyy)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario D18: Ineffective Date Invalid (Reject 05) 
+  
+CSV Record:
+  NDC: "50505050505"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/15/2026"
+  RMV_DATE: "11/31/2026"  ← November only has 30 days
+
+Validation:    FAIL
+Error Code: Reject 05
+Error Message: "INEFFECTIVE DATE INVALID FORMAT"
+
+Exception Log: 
+  "Reject 05 - INEFFECTIVE DATE INVALID FORMAT:  '11/31/2026' (not a valid date)"
+
+Result: Record NOT processed
+ 
+
+---
+
+##  CATEGORY E: BUSINESS RULE ERRORS 
+
+Scenario E1: Duplicate Records in Same File (Reject 11) 
+  
+CSV Records (same file):
+  Record 1:
+    NDC:  "60606060606"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/15/2026"
+  
+  Record 2:
+    NDC: "60606060606"
+    REIMB_CODE:  "J0135"
+    ADD_DATE: "01/15/2026"
+
+Validation:   FAIL
+Error Code: Reject 11
+Error Message: "DUPLICATE RECORDS"
+
+Action: REJECT both records (entire group per Rule 4)
+
+Exception Log:
+  "Reject 11 - DUPLICATE RECORDS: Key (NDC:  60606060606, Proc:  J0135, Eff:  01/15/2026) appears 2 times"
+
+Result: Neither record processed
+
+Business Impact: Prevents duplicate inserts
+ 
+
+---
+
+Scenario E2: Overlap - New Record Overlaps Open-Ended Existing (Reject 13/14) 
+  
+CSV Record:
+  NDC: "70707070707"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "06/01/2026"
+  RMV_DATE: ""
+
+Existing MMIS Record:
+  NDC: "70707070707"
+  Procedure_Code: "J0135"
+  Effective_Date: 2026-01-01
+  Ineffective_Date:  NULL  ← Open-ended
+
+Validation:   FAIL
+Error Code:  Reject 13/14
+Error Message: "CURRENT RECORD OVERLAPS WITH PREVIOUS RECORD"
+
+Overlap Analysis:
+  Existing:  2026-01-01 → (open)
+  New:       2026-06-01 → (open)
+  Overlap:   2026-06-01 → (open)  ✗
+
+Exception Log:
+  "Reject 13/14 - OVERLAP:  New effective 06/01/2026 falls within existing range (01/01/2026 - open)"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario E3: Overlap - New Record Overlaps Closed Period (Reject 13/14) 
+  
+CSV Record:
+  NDC: "80808080808"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "03/15/2026"
+  RMV_DATE: "09/30/2026"
+
+Existing MMIS Record: 
+  NDC: "80808080808"
+  Procedure_Code: "J0135"
+  Effective_Date: 2026-01-01
+  Ineffective_Date: 2026-06-30
+
+Validation:   FAIL
+Error Code: Reject 13/14
+Error Message: "CURRENT RECORD OVERLAPS WITH PREVIOUS RECORD"
+
+Overlap Analysis:
+  Existing: 2026-01-01 → 2026-06-30
+  New:      2026-03-15 → 2026-09-30
+  Overlap:  2026-03-15 → 2026-06-30  ✗
+
+Exception Log:
+  "Reject 13/14 - OVERLAP:  Periods (03/15/2026 - 09/30/2026) and (01/01/2026 - 06/30/2026) overlap"
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario E4: Overlap - New Open-Ended Overlaps Existing Closed (Reject 13/14) 
+  
+CSV Record:
+  NDC: "90909090909"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "05/01/2026"
+  RMV_DATE: ""  ← Open-ended
+
+Existing MMIS Record:
+  NDC: "90909090909"
+  Procedure_Code: "J0135"
+  Effective_Date: 2026-03-01
+  Ineffective_Date: 2026-08-31
+
+Validation:   FAIL
+Error Code: Reject 13/14
+Error Message:  "CURRENT RECORD OVERLAPS WITH PREVIOUS RECORD"
+
+Overlap Analysis:
+  Existing:  2026-03-01 → 2026-08-31
+  New:      2026-05-01 → (open)
+  Overlap:  2026-05-01 → 2026-08-31  ✗
+
+Result: Record NOT processed
+ 
+
+---
+
+Scenario E5: NO Overlap - New After Existing Closes (SUCCESS) 
+  
+CSV Record:
+  NDC: "10203040506"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "07/01/2026"
+  RMV_DATE: ""
+
+Existing MMIS Record: 
+  NDC: "10203040506"
+  Procedure_Code: "J0135"
+  Effective_Date: 2026-01-01
+  Ineffective_Date: 2026-06-30
+
+Validation:   PASS (no overlap)
+
+Overlap Analysis:
+  Existing: 2026-01-01 → 2026-06-30
+  New:      2026-07-01 → (open)
+  Gap:      None (consecutive dates)  ✓
+
+Action: INSERT new record
+
+Database After: 
+  - Record 1: Eff: 2026-01-01, Ineff: 2026-06-30
+  - Record 2: Eff: 2026-07-01, Ineff: NULL  ← NEW
+ 
+
+---
+
+Scenario E6: NO Overlap - Gap Between Records (SUCCESS) 
+  
+CSV Record:
+  NDC: "11122233344"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "08/01/2026"
+  RMV_DATE: ""
+
+Existing MMIS Record:
+  NDC: "11122233344"
+  Procedure_Code:  "J0135"
+  Effective_Date: 2026-01-01
+  Ineffective_Date: 2026-06-30
+
+Validation:   PASS (no overlap)
+
+Overlap Analysis:
+  Existing: 2026-01-01 → 2026-06-30
+  New:      2026-08-01 → (open)
+  Gap:      2026-07-01 to 2026-07-31  ✓
+
+Action: INSERT new record
+
+Database After: 
+  - Record 1: Eff: 2026-01-01, Ineff: 2026-06-30
+  - Record 2: Eff: 2026-08-01, Ineff: NULL  ← NEW
+
+Note: Gap in coverage from 07/01 to 07/31 (may be intentional)
+ 
+
+---
+
+Scenario E7: Attempt to Update Closed Record (Error) 
+  
+CSV Record:
+  NDC: "22233344455"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/15/2026"
+  RMV_DATE: "09/30/2026"  ← Trying to change ineffective date
+
+Existing MMIS Record:
+  NDC: "22233344455"
+  Procedure_Code: "J0135"
+  Effective_Date: 2026-01-15
+  Ineffective_Date:  2026-06-30  ← Already has ineffective date
+
+Validation:   FAIL
+Error Message: "ATTEMPT TO UPDATE CLOSED RECORD"
+
+Exception Log:
+  "ATTEMPT TO UPDATE CLOSED RECORD:  NDC 22233344455, Proc J0135, Eff 01/15/2026 already closed with Ineff 06/30/2026"
+  "Cannot change ineffective date from 06/30/2026 to 09/30/2026"
+
+Result: Record NOT processed
+
+Business Rule:  Once a record is closed (has ineffective date), it cannot be modified
+ 
+
+---
+
+Scenario E8: Overlap with Multiple Existing Records (Reject 13/14) 
+  
+CSV Record:
+  NDC: "33344455566"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "04/01/2026"
+  RMV_DATE: "10/31/2026"
+
+Existing MMIS Records:
+  Record 1:
+    Effective: 2026-01-01
+    Ineffective: 2026-03-31
+  
+  Record 2:
+    Effective: 2026-07-01
+    Ineffective:  NULL
+
+Validation:   FAIL
+Error Code: Reject 13/14
+Error Message: "CURRENT RECORD OVERLAPS WITH PREVIOUS RECORD"
+
+Overlap Analysis:
+  New:      2026-04-01 → 2026-10-31
+  Record 1: 2026-01-01 → 2026-03-31  ✓ (no overlap)
+  Record 2: 2026-07-01 → (open)      ✗ (overlap from 07/01 to 10/31)
+
+Exception Log:
+  "Reject 13/14 - OVERLAP: New record (04/01/2026 - 10/31/2026) overlaps existing record (07/01/2026 - open)"
+
+Result: Record NOT processed
+ 
+
+---
+
+##  CATEGORY F: GROUP REJECTION (Rule 4) 
+
+Scenario F1: One Bad Record Rejects Entire Group 
+  
+CSV Records (same NDC-Proc combination):
+  Record 1:
+    NDC: "44455566677"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/01/2026"
+    RMV_DATE: "06/30/2026"
+    [VALID]
+  
+  Record 2:
+    NDC: "44455566677"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "07/01/2026"
+    RMV_DATE: ""
+    [VALID]
+  
+  Record 3:
+    NDC: "44455566677"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "INVALID_DATE"  ← ERROR
+    RMV_DATE:  ""
+    [INVALID - Reject 04]
+
+Validation:   FAIL for entire group
+Error:  Record 3 has "EFFECTIVE DATE INVALID FORMAT - Reject 04"
+
+Action: REJECT all 3 records (per Rule 4)
+
+Exception Log:
+  "Reject 04 - EFFECTIVE DATE INVALID FORMAT for Record 3 (NDC:  44455566677, Proc:  J0135)"
+  "Records 1 and 2 also rejected due to group rejection rule (Rule 4)"
+  "Group key: NDC 44455566677 + Proc J0135"
+  "3 records rejected from group"
+
+Result:  NONE of the records processed
+
+Business Impact: Data quality control - prevents partial updates
+ 
+
+---
+
+Scenario F2: Multiple Errors in Same Group 
+  
+CSV Records (same NDC-Proc):
+  Record 1:
+    NDC: "55566677788"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/01/2026"
+    [VALID]
+  
+  Record 2:
+    NDC:  ""  ← MISSING NDC
+    REIMB_CODE: "J0135"
+    ADD_DATE: "02/01/2026"
+    [INVALID - Reject 01]
+  
+  Record 3:
+    NDC: "55566677788"
+    REIMB_CODE: "J0135"
+    IS_NOC: "X"  ← INVALID NOC
+    ADD_DATE: "03/01/2026"
+    [INVALID - Reject 03]
+
+Validation:   FAIL for entire group
+Errors:  Multiple validation failures
+
+Action: REJECT all records
+
+Exception Log:
+  "Reject 01 - NDC MISSING for Record 2"
+  "Reject 03 - NOC INDICATOR UNKNOWN VALUE for Record 3"
+  "Record 1 also rejected due to group rejection rule (Rule 4)"
+  "Group key:  Proc J0135 (NDC varies due to missing value)"
+  "3 records rejected from group"
+
+Result: No records processed
+ 
+
+---
+
+Scenario F3: Different Groups Processed Independently 
+  
+CSV Records:
+Group A (NDC: 66677788899, Proc: J0135):
+  Record A1: ADD_DATE: "01/01/2026" [VALID]
+  Record A2: ADD_DATE: "INVALID"     [INVALID - Reject 04]
+
+Group B (NDC: 77788899900, Proc: J0180):
+  Record B1: ADD_DATE: "01/01/2026" [VALID]
+  Record B2: ADD_DATE: "07/01/2026" [VALID]
+
+Group C (NDC: 88899900011, Proc: J1100):
+  Record C1: ADD_DATE: "01/01/2026" [VALID]
+
+Validation: 
+  Group A:   FAIL (Record A2 invalid)
+  Group B:   PASS
+  Group C:   PASS
+
+Action: 
+  - REJECT all Group A records (Rule 4)
+  - PROCESS all Group B records
+  - PROCESS all Group C records
+
+Database After:
+  - Group A:  Not processed (0 records)
+  - Group B: 2 records inserted
+  - Group C: 1 record inserted
+
+Exception Log:
+  "Reject 04 for Group A Record 2; entire Group A rejected per Rule 4"
+  "Groups B and C processed successfully (independent groups)"
+
+Business Meaning: Errors in one NDC-Proc group don't affect other groups
+ 
+
+---
+
+Scenario F4: Large Group - All Valid 
+  
+CSV Records (same NDC-Proc, sorted by effective date):
+  NDC: "99900011122"
+  REIMB_CODE: "J0135"
+  
+  Record 1: ADD_DATE: "01/01/2025", RMV_DATE: "03/31/2025"
+  Record 2: ADD_DATE: "04/01/2025", RMV_DATE: "06/30/2025"
+  Record 3: ADD_DATE: "07/01/2025", RMV_DATE: "09/30/2025"
+  Record 4: ADD_DATE: "10/01/2025", RMV_DATE: "12/31/2025"
+  Record 5: ADD_DATE: "01/01/2026", RMV_DATE: ""
+
+All records:  [VALID]
+
+Validation:   PASS
+
+Processing Order (Rule 3): Record 1 → 2 → 3 → 4 → 5 (oldest first)
+
+Action: INSERT all 5 records in sequence
+
+Database After:
+  - 5 sequential records creating complete timeline
+
+Business Meaning: Quarterly mapping changes processed as a group
+ 
+
+---
+
+##  CATEGORY G: EDGE CASES & SPECIAL SCENARIOS 
+
+Scenario G1: Effective Date = Ineffective Date (Same Day Mapping) 
+  
+CSV Record:
+  NDC: "10111213141"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/15/2026"
+  RMV_DATE: "01/15/2026"  ← Same as effective date
+
+Validation:   PASS (no explicit rule forbids this)
+
+Action: INSERT record
+
+Database After:
+  Effective: 2026-01-15
+  Ineffective: 2026-01-15
+
+Business Question: Should one-day mappings be allowed? 
+Recommendation:  Clarify with BA if this is valid business scenario
+
+Potential Use Case: Emergency mapping correction
+ 
+
+---
+
+Scenario G2: Ineffective Date Before Effective Date (Logical Error) 
+  
+CSV Record:
+  NDC: "15161718192"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "06/01/2026"
+  RMV_DATE: "01/01/2026"  ← Before effective date! 
+
+Validation:  AMBIGUOUS (no explicit rule in BRD)
+
+Current BRD: No validation rule exists
+Recommendation: ADD new validation rule
+
+Suggested Rule: 
+  Error Code: Reject 06
+  Error Message: "INEFFECTIVE DATE BEFORE EFFECTIVE DATE"
+  Validation: IF RMV_DATE < ADD_DATE THEN REJECT
+
+Action for now: May pass validation (depends on implementation)
+
+Recommendation: Discuss with BA and add to BRD
+ 
+
+---
+
+Scenario G3: Very Old Historical Data 
+  
+CSV Record:
+  NDC: "20212223242"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/01/2020"
+  RMV_DATE: "12/31/2020"
+
+Current Date: 2026-01-21
+
+Validation:   PASS (no rule against old dates)
+
+Action: INSERT record
+
+Database After:
+  Effective: 2020-01-01
+  Ineffective:  2020-12-31
+
+Business Meaning: Historical data load for rebate reconciliation
+Use Case: May need to process old claims or calculate retroactive rebates
+ 
+
+---
+
+Scenario G4: Far Future Effective Date 
+  
+CSV Record:
+  NDC: "25262728293"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/01/2030"  ← 4 years in future
+  RMV_DATE: ""
+
+Current Date: 2026-01-21
+
+Validation:   PASS
+
+Action: INSERT record
+
+Database After:
+  Effective:  2030-01-01
+  Ineffective: NULL
+
+Business Meaning: Pre-planned mapping for future drug approval
+Note: Consider adding business rule to flag dates > X years in future
+ 
+
+---
+
+Scenario G5: Whitespace in NDC (Data Quality Issue) 
+  
+CSV Record:
+  NDC: " 30313233343 "  ← Leading/trailing spaces
+  REIMB_CODE: "J0135"
+  ADD_DATE: "01/15/2026"
+
+Without TRIM: 
+  Validation:   FAIL - "NDC INVALID FORMAT" (length != 11)
+
+With TRIM (recommended):
+  After cleaning: NDC = "30313233343"
+  Validation:   PASS
+  Action: INSERT record
+
+Recommendation:  Implement TRIM() for all text fields during data load
+ 
+
+---
+
+Scenario G6: Whitespace in Dates 
+  
+CSV Record:
+  NDC: "35363738394"
+  REIMB_CODE: "J0135"
+  ADD_DATE: " 01/15/2026 "  ← Spaces
+
+Recommendation:  TRIM before date parsing
+
+After TRIM:  "01/15/2026"
+Validation:   PASS
+Action: INSERT record
+ 
+
+---
+
+Scenario G7: Leading Zeros in NDC (Must Preserve) 
+  
+CSV Record:
+  NDC: "00012345678"  ← Leading zeros
+
+Important: NDC must be stored as TEXT, not INTEGER
+
+As TEXT: "00012345678"  ✓ Correct
+As INTEGER: 12345678    ✗ Wrong (loses leading zeros)
+
+Validation:   PASS
+Action: INSERT with leading zeros preserved
+
+Database After:
+  NDC: "00012345678" (stored as TEXT field)
+
+Business Impact: Leading zeros are significant in NDC structure
+ 
+
+---
+
+Scenario G8: Case Sensitivity - NOC Indicator 
+  
+CSV Record:
+  NDC:  "40414243444"
+  REIMB_CODE: "J3490"
+  IS_NOC: "y"  ← Lowercase
+
+Strict Interpretation: 
+  Validation:   FAIL - "NOC INDICATOR UNKNOWN VALUE"
+  (BRD specifies uppercase "Y")
+
+Case-Insensitive (recommended):
+  Convert to uppercase: "Y"
+  Validation:   PASS
+  Action: INSERT with IS_NOC = "Y"
+
+Recommendation: Implement case-insensitive comparison OR uppercase conversion
+ 
+
+---
+
+Scenario G9: Empty String vs NULL 
+  
+CSV Record:
+  NDC: "45464748495"
+  REIMB_CODE: "J0135"
+  IS_NOC: ""     ← Empty string
+  RMV_DATE: ""   ← Empty string
+  ADD_DATE: "01/15/2026"
+
+Processing:
+  Empty string should be treated as NULL
+
+Database After:
+  IS_NOC: NULL (not empty string)
+  RMV_DATE: NULL (not empty string)
+
+Recommendation: Convert empty strings to NULL during insert
+ 
+
+---
+
+Scenario G10: Leap Year Date 
+  
+CSV Record:
+  NDC: "50515253545"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "02/29/2024"  ← Valid leap year date
+  RMV_DATE:  ""
+
+Validation:   PASS (2024 is leap year)
+
+Action: INSERT record
+
+---
+
+CSV Record:
+  NDC: "55565758596"
+  REIMB_CODE: "J0135"
+  ADD_DATE: "02/29/2025"  ← Invalid (2025 not leap year)
+
+Validation:   FAIL
+Error Code: Reject 04
+Error Message: "EFFECTIVE DATE INVALID FORMAT"
+
+Recommendation: Date validation must check leap years
+ 
+
+---
+
+##  CATEGORY H: MONTHLY FILE PROCESSING SCENARIOS 
+
+Scenario H1: First Month Load (Baseline) 
+  
+Month:  January 2026
+File: "2026-01 ReimbursementCode Xwalk History-CSV Format.zip"
+File_Date: 2026-01-15
+
+CSV Records:
+  Record 1:
+    NDC: "60616263646"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/01/2026"
+    RMV_DATE: ""
+
+Existing MMIS:  Empty
+
+Action: INSERT record
+
+Database After (January):
+  - NDC: "60616263646", Proc:  "J0135", Eff:  2026-01-01, Ineff: NULL
+ 
+
+---
+
+Scenario H2: Second Month - Close Previous Mapping 
+  
+Month: February 2026
+File: "2026-02 ReimbursementCode Xwalk History-CSV Format.zip"
+File_Date: 2026-02-15
+
+CSV Records:
+  Record 1:
+    NDC: "60616263646"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/01/2026"
+    RMV_DATE: "01/31/2026"  ← Now has end date
+  
+  Record 2:
+    NDC: "60616263646"
+    REIMB_CODE:  "J0135"
+    ADD_DATE: "02/01/2026"  ← New mapping starts
+    RMV_DATE: ""
+
+Existing MMIS: 
+  - NDC: "60616263646", Proc: "J0135", Eff: 2026-01-01, Ineff: NULL
+
+Processing: 
+  Record 1: UPDATE existing (key match), set Ineff = 2026-01-31
+  Record 2: INSERT new record
+
+Database After (February):
+  - Record 1: Eff: 2026-01-01, Ineff: 2026-01-31  ← UPDATED
+  - Record 2: Eff: 2026-02-01, Ineff: NULL        ← NEW
+ 
+
+---
+
+Scenario H3: Third Month - No Changes (Idempotent) 
+  
+Month: March 2026
+File: "2026-03 ReimbursementCode Xwalk History-CSV Format.zip"
+File_Date: 2026-03-15
+
+CSV Records (same as February):
+  Record 1:
+    NDC: "60616263646"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/01/2026"
+    RMV_DATE: "01/31/2026"
+  
+  Record 2:
+    NDC: "60616263646"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "02/01/2026"
+    RMV_DATE: ""
+
+Existing MMIS:
+  - Record 1: Eff: 2026-01-01, Ineff: 2026-01-31
+  - Record 2: Eff: 2026-02-01, Ineff: NULL
+
+Processing:
+  Record 1: No change (values match)
+  Record 2: No change (values match)
+
+Database After (March):
+  No changes (idempotent processing)
+ 
+
+---
+
+Scenario H4: Fourth Month - Add Historical Correction 
+  
+Month: April 2026
+File: "2026-04 ReimbursementCode Xwalk History-CSV Format.zip"
+File_Date: 2026-04-15
+
+CSV Records:
+  Record 1: [Same as before - 01/01/2026 - 01/31/2026]
+  Record 2: [Same as before - 02/01/2026 - open]
+  
+  Record 3 (NEW - Historical):
+    NDC: "60616263646"
+    REIMB_CODE: "J0135"
+    ADD_DATE: "07/01/2025"  ← Historical date
+    RMV_DATE:  "12/31/2025"
+
+Existing MMIS:
+  - Record 1: Eff: 2026-01-01, Ineff: 2026-01-31
+  - Record 2: Eff: 2026-02-01, Ineff: NULL
+
+Processing:
+  Record 3: New record with retro effective date
+  
+Validation:   PASS with WARNING 15
+Warning: "RETRO RECORD" (Ineff 12/31/2025 < Eff 01/01/2026, no overlap)
+
+Action: INSERT Record 3, log warning
+
+Database After (April):
+  - Record 3: Eff: 2025-07-01, Ineff: 2025-12-31  ← NEW (historical)
+  - Record 1: Eff: 2026-01-01, Ineff: 2026-01-31
+  - Record 2: Eff: 2026-02-01, Ineff: NULL
+
+Warning Log:
+  "WARNING 15 - RETRO RECORD: NDC 60616263646, Proc J0135, Eff 07/01/2025"
+ 
+
+---
+
+##  CATEGORY I: COMPLEX REAL-WORLD SCENARIOS 
+
+Scenario I1: NDC Switches Procedure Codes Mid-Year 
+  
+CSV Records:
+  Record 1:
+    NDC: "70717273747"
+    REIMB_CODE: "J0135"  ← Old procedure code
+    ADD_DATE:  "01/01/2026"
+    RMV_DATE:  "06/30/2026"  ← Ends
+  
+  Record 2:
+    NDC: "70717273747"
+    REIMB_CODE: "J0180"  ← New procedure code
+    ADD_DATE: "07/01/2026"  ← Starts
+    RMV_DATE: ""
+
+Validation:   PASS (different procedure codes = different combinations)
+
+Action: INSERT both records
+
+Database After:
+  - NDC: "70717273747", Proc: "J0135", Eff: 01/01/2026, Ineff: 06/30/2026
+  - NDC: "70717273747", Proc:  "J0180", Eff: 07/01/2026, Ineff: NULL
+
+Business Meaning: Drug reclassified to different billing code
+Impact on Claims: 
+  - Claims before 07/01/2026: Use J0135
+  - Claims on/after 07/01/2026: Use J0180
+ 
+
+---
+
+Scenario I2: Multiple NDCs Map to Same Procedure (Generic Drug) 
+  
+CSV Records:
+  Record 1:
+    NDC: "80818283848"  ← Brand name
+    REIMB_CODE:  "J0135"
+    ADD_DATE: "01/01/2026"
+  
+  Record 2:
+    NDC: "85868788899"  ← Generic manufacturer 1
+    REIMB_CODE:  "J0135"
+    ADD_DATE: "01/01/2026"
+  
+  Record 3:
+    NDC:  "90919293949"  ← Generic manufacturer 2
+    REIMB_CODE: "J0135"
+    ADD_DATE: "01/01/2026"
+
+Validation:    PASS
+
+Action: INSERT all 3 records
+
+Database After: 
+  - 3 different NDCs all map to J0135
+
+Business Meaning: Brand and generic versions use same procedure code
+Use Case: Drug rebate calculation differs by manufacturer NDC
+ 
+
+---
+
+Scenario I3: NOC Code Graduation to Specific Code 
+  
+Initial State (January):
+  NDC: "95969798990"
+  REIMB_CODE: "J3490"  ← NOC code
+  IS_NOC: "Y"
+  ADD_DATE: "01/01/2026"
+  RMV_DATE: ""
+
+Update (July):
+  CSV Record 1:
+    NDC: "95969798990"
+    REIMB_CODE: "J3490"
+    IS_NOC: "Y"
+    ADD_DATE: "01/01/2026"
+    RMV_DATE: "06/30/2026"  ← Close NOC mapping
+  
+  CSV Record 2:
+    NDC: "95969798990"
+    REIMB_CODE: "J2794"  ← New specific code assigned
+    IS_NOC: ""
+    ADD_DATE: "07/01/2026"
+    RMV_DATE: ""
+
+Processing:
+  Record 1: UPDATE existing, set Ineff = 06/30/2026
+  Record 2: INSERT new mapping
+
+Database After:
+  - Proc: "J3490" (NOC), Eff: 01/01/2026, Ineff: 06/30/2026  ← Closed
+  - Proc: "J2794", Eff: 07/01/2026, Ineff:  NULL              ← Active
+
+Business Meaning: Drug received specific HCPCS code (no longer NOC)
+ 
+
+---
+
+Scenario I4: Seasonal Drug Mapping (Flu Vaccine) 
+  
+CSV Records:
+  # 2025 Flu Season
+  Record 1:
+    NDC: "10203040516"
+    REIMB_CODE: "90686"
+    ADD_DATE: "09/01/2025"
+    RMV_DATE: "03/31/2026"
+  
+  # 2026 Flu Season
+  Record 2:
+    NDC: "10203040517"  ← New formulation NDC
+    REIMB_CODE: "90686"
+    ADD_DATE: "09/01/2026"
+    RMV_DATE: ""
+
+Validation:   PASS
+
+Action: INSERT both records
+
+Database After:
+  - Old NDC:  Eff: 09/01/2025, Ineff: 03/31/2026  (closed)
+  - New NDC: Eff: 09/01/2026, Ineff:  NULL        (active)
+
+Business Meaning: Annual flu vaccine formulation change

@@ -1,0 +1,589 @@
+USE [DW_Reference]
+GO
+
+/****** Object:  StoredProcedure [dbo].[usp_Process_NDC_Xwalk]    Script Date: 1/24/2026 9:02:17 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+CREATE PROCEDURE [dbo].[usp_Process_NDC_Xwalk]
+    @FileDate DATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @StartTime DATETIME2 = GETDATE();
+    DECLARE @TotalRecords INT = 0;
+    DECLARE @ExcludedRecords INT = 0;
+    DECLARE @InsertedRecords INT = 0;
+    DECLARE @UpdatedRecords INT = 0;
+    DECLARE @RejectedRecords INT = 0;
+    DECLARE @WarningRecords INT = 0;
+    
+    BEGIN TRY
+        
+        PRINT '============================================================';
+        PRINT 'NDC CROSSWALK PROCESSING';
+        PRINT 'File Date: ' + CONVERT(VARCHAR, @FileDate, 23);
+        PRINT 'Start Time: ' + CONVERT(VARCHAR, @StartTime, 120);
+        PRINT '============================================================';
+        
+        -- =====================================================
+        -- STEP 1: Count total records
+        -- =====================================================
+        
+        SELECT @TotalRecords = COUNT(*)
+        FROM dbo.RJHealth_Drug_Data
+        WHERE File_Date = @FileDate;
+        
+        PRINT 'Total records in file: ' + CAST(@TotalRecords AS VARCHAR);
+        
+        -- Count excluded records (RMV_DATE < 2014-01-01)
+        SELECT @ExcludedRecords = COUNT(*)
+        FROM dbo.RJHealth_Drug_Data
+        WHERE File_Date = @FileDate
+            AND RMV_DATE IS NOT NULL
+            AND LTRIM(RTRIM(RMV_DATE)) <> ''
+            AND TRY_CONVERT(DATE, RMV_DATE, 101) < '2014-01-01';
+        
+        PRINT 'Excluded records (RMV_DATE < 2014-01-01): ' + CAST(@ExcludedRecords AS VARCHAR);
+        PRINT 'Records to process: ' + CAST(@TotalRecords - @ExcludedRecords AS VARCHAR);
+        
+        IF (@TotalRecords - @ExcludedRecords) = 0
+        BEGIN
+            PRINT 'WARNING: No records to process after exclusions';
+            RETURN;
+        END
+        
+        -- =====================================================
+        -- STEP 2: Create temp working table with validation
+        -- =====================================================
+        
+        IF OBJECT_ID('tempdb..#WorkingData') IS NOT NULL DROP TABLE #WorkingData;
+        
+        SELECT 
+            LTRIM(RTRIM(NDC)) AS NDC,
+            LTRIM(RTRIM(DRUG_NAME)) AS DRUG_NAME,
+            LTRIM(RTRIM(REIMB_CODE)) AS Procedure_Code,
+            LTRIM(RTRIM(RC_DESC)) AS RC_DESC,
+            CASE 
+                WHEN UPPER(LTRIM(RTRIM(IS_NOC))) = 'Y' THEN 'Y' 
+                ELSE NULL 
+            END AS NOC_Indicator,
+            TRY_CONVERT(DATE, ADD_DATE, 101) AS Effective_Date,
+            CASE 
+                WHEN RMV_DATE IS NULL OR LTRIM(RTRIM(RMV_DATE)) = '' THEN NULL
+                ELSE TRY_CONVERT(DATE, RMV_DATE, 101)
+            END AS Ineffective_Date,
+            CASE 
+                WHEN BILL_UNITS IS NOT NULL AND ISNUMERIC(BILL_UNITS) = 1 
+                THEN TRY_CAST(BILL_UNITS AS DECIMAL(12,6))
+                ELSE NULL 
+            END AS BILL_UNITS,
+            CASE 
+                WHEN BILL_UNITS_PER_PKG IS NOT NULL AND ISNUMERIC(BILL_UNITS_PER_PKG) = 1 
+                THEN TRY_CAST(BILL_UNITS_PER_PKG AS DECIMAL(12,6))
+                ELSE NULL 
+            END AS BILL_UNITS_PER_PKG,
+            CASE 
+                WHEN PKG_SIZE IS NOT NULL AND ISNUMERIC(PKG_SIZE) = 1 
+                THEN TRY_CAST(PKG_SIZE AS DECIMAL(12,6))
+                ELSE NULL 
+            END AS PKG_SIZE,
+            CASE 
+                WHEN PKG_QTY IS NOT NULL AND ISNUMERIC(PKG_QTY) = 1 
+                THEN TRY_CAST(PKG_QTY AS INT)
+                ELSE NULL 
+            END AS PKG_QTY,
+            LTRIM(RTRIM(UOM)) AS UOM,
+            LTRIM(RTRIM(PKG_UOM)) AS PKG_UOM,
+            File_Date,
+            
+            -- Validation flags
+            CAST(CASE 
+                -- Reject 01: NDC validations
+                WHEN NDC IS NULL OR LTRIM(RTRIM(NDC)) = '' 
+                    THEN 'Reject 01: NDC MISSING'
+                WHEN LEN(LTRIM(RTRIM(NDC))) <> 11 
+                    THEN 'Reject 01: NDC INVALID FORMAT (length)'
+                WHEN LTRIM(RTRIM(NDC)) LIKE '%[^0-9]%' 
+                    THEN 'Reject 01: NDC INVALID FORMAT (non-numeric)'
+                
+                -- Reject 02: Procedure Code validations
+                WHEN REIMB_CODE IS NULL OR LTRIM(RTRIM(REIMB_CODE)) = '' 
+                    THEN 'Reject 02: PROCEDURE CODE MISSING'
+                WHEN LEN(LTRIM(RTRIM(REIMB_CODE))) <> 5 
+                    THEN 'Reject 02: PROCEDURE CODE INVALID FORMAT (length)'
+                WHEN LTRIM(RTRIM(REIMB_CODE)) LIKE '%[^A-Z0-9]%' 
+                    THEN 'Reject 02: PROCEDURE CODE INVALID FORMAT (alphanumeric)'
+                
+                -- Reject 03: NOC Indicator validation (case-insensitive)
+                WHEN IS_NOC IS NOT NULL 
+                    AND LTRIM(RTRIM(IS_NOC)) <> '' 
+                    AND UPPER(LTRIM(RTRIM(IS_NOC))) <> 'Y' 
+                    THEN 'Reject 03: NOC INDICATOR UNKNOWN VALUE'
+                
+                -- Reject 04: Effective Date validations
+                WHEN ADD_DATE IS NULL OR LTRIM(RTRIM(ADD_DATE)) = '' 
+                    THEN 'Reject 04: EFFECTIVE DATE MISSING'
+                WHEN TRY_CONVERT(DATE, ADD_DATE, 101) IS NULL 
+                    THEN 'Reject 04: EFFECTIVE DATE INVALID FORMAT'
+                
+                -- Reject 05: Ineffective Date validation
+                WHEN RMV_DATE IS NOT NULL 
+                    AND LTRIM(RTRIM(RMV_DATE)) <> '' 
+                    AND TRY_CONVERT(DATE, RMV_DATE, 101) IS NULL 
+                    THEN 'Reject 05: INEFFECTIVE DATE INVALID FORMAT'
+                
+                -- Reject 06: Ineffective before Effective
+                WHEN TRY_CONVERT(DATE, RMV_DATE, 101) IS NOT NULL 
+                    AND TRY_CONVERT(DATE, ADD_DATE, 101) IS NOT NULL
+                    AND TRY_CONVERT(DATE, RMV_DATE, 101) < TRY_CONVERT(DATE, ADD_DATE, 101)
+                    THEN 'Reject 06: INEFFECTIVE DATE BEFORE EFFECTIVE DATE'
+                
+                ELSE NULL
+            END AS NVARCHAR(500)) AS Validation_Error,
+            
+            0 AS Is_Processed
+            
+        INTO #WorkingData
+        FROM dbo.RJHealth_Drug_Data
+        WHERE File_Date = @FileDate
+            -- =====================================================
+            -- NEW EXCLUSION FILTER: Exclude RMV_DATE < 2014-01-01
+            -- =====================================================
+            AND (
+                -- Include if RMV_DATE is NULL or empty (open-ended records)
+                RMV_DATE IS NULL 
+                OR LTRIM(RTRIM(RMV_DATE)) = ''
+                -- OR include if RMV_DATE conversion fails (will be caught by validation)
+                OR TRY_CONVERT(DATE, RMV_DATE, 101) IS NULL
+                -- OR include if RMV_DATE >= 2014-01-01 (recent closed mappings)
+                OR TRY_CONVERT(DATE, RMV_DATE, 101) >= '2014-01-01'
+            );
+        
+	DECLARE @WorkingCount INT = (SELECT COUNT(*) FROM #WorkingData);
+        PRINT 'Working data loaded: ' + CAST(@WorkingCount AS VARCHAR) + ' records';
+        -- =====================================================
+        -- STEP 3: Log field validation errors
+        -- =====================================================
+        
+        -- Log field validation errors
+        INSERT INTO dbo.NDC_Xwalk_Process_Log (
+            File_Date, NDC, Procedure_Code, Effective_Date, Ineffective_Date,
+            Log_Type, Error_Code, Message, Action_Taken
+        )
+        SELECT 
+            @FileDate,
+            NDC,
+            Procedure_Code,
+            Effective_Date,
+            Ineffective_Date,
+            'ERROR',
+            LEFT(Validation_Error, CHARINDEX(':', Validation_Error) - 1),
+            Validation_Error,
+            'REJECTED'
+        FROM #WorkingData
+        WHERE Validation_Error IS NOT NULL;
+        
+        SET @RejectedRecords = @@ROWCOUNT;
+        PRINT 'Field validation errors: ' + CAST(@RejectedRecords AS VARCHAR);
+        
+        INSERT INTO dbo.NDC_Xwalk_Process_Log (
+            File_Date, NDC, Procedure_Code, Effective_Date, Ineffective_Date,
+            Log_Type, Error_Code, Message, Action_Taken
+        )
+        SELECT 
+            @FileDate,
+            NDC,
+            Procedure_Code,
+            Effective_Date,
+            Ineffective_Date,
+            'ERROR',
+            'Reject 11',
+            'DUPLICATE RECORDS: Key appears ' + CAST(COUNT(*) AS VARCHAR) + ' times',
+            'REJECTED'
+        FROM #WorkingData
+        WHERE Validation_Error IS NULL
+        GROUP BY NDC, Procedure_Code, Effective_Date, Ineffective_Date
+        HAVING COUNT(*) > 1;
+        
+        -- Mark duplicates with error
+        UPDATE w
+        SET Validation_Error = 'Reject 11: DUPLICATE RECORDS'
+        FROM #WorkingData w
+        WHERE Validation_Error IS NULL
+            AND EXISTS (
+                SELECT 1
+                FROM #WorkingData w2
+                WHERE w2.NDC = w.NDC
+                    AND w2.Procedure_Code = w.Procedure_Code
+                    AND w2.Effective_Date = w.Effective_Date
+                    AND w2.Validation_Error IS NULL
+                GROUP BY w2.NDC, w2.Procedure_Code, w2.Effective_Date
+                HAVING COUNT(*) > 1
+            );
+        
+        -- =====================================================
+        -- FIX 2: IMPROVED OVERLAP CHECK - Use Projected State
+        -- CORRECTED: Only include columns needed for overlap check
+        -- =====================================================
+        
+        IF OBJECT_ID('tempdb..#ProjectedProduction') IS NOT NULL DROP TABLE #ProjectedProduction;
+        
+        SELECT NDC, Procedure_Code, Effective_Date, Ineffective_Date
+        INTO #ProjectedProduction
+        FROM dbo.Procedure_NDC_Xwalk;
+        
+        -- Apply ineffective date updates from working data to create projected state
+        UPDATE proj
+        SET proj.Ineffective_Date = w.Ineffective_Date
+        FROM #ProjectedProduction proj
+        INNER JOIN #WorkingData w ON
+            proj.NDC = w.NDC
+            AND proj.Procedure_Code = w.Procedure_Code
+            AND proj.Effective_Date = w.Effective_Date
+        WHERE w.Validation_Error IS NULL
+            AND w.Ineffective_Date IS NOT NULL;
+        
+        INSERT INTO dbo.NDC_Xwalk_Process_Log (
+            File_Date, NDC, Procedure_Code, Effective_Date, Ineffective_Date,
+            Log_Type, Error_Code, Message, Action_Taken
+        )
+        SELECT 
+            @FileDate,
+            w.NDC,
+            w.Procedure_Code,
+            w.Effective_Date,
+            w.Ineffective_Date,
+            'ERROR',
+            'Reject 13/14',
+            'OVERLAP: New (' + CONVERT(VARCHAR, w.Effective_Date, 23) + ' to ' + 
+                ISNULL(CONVERT(VARCHAR, w.Ineffective_Date, 23), 'open') + ') overlaps existing (' +
+                CONVERT(VARCHAR, p.Effective_Date, 23) + ' to ' + 
+                ISNULL(CONVERT(VARCHAR, p.Ineffective_Date, 23), 'open') + ')',
+            'REJECTED'
+        FROM #WorkingData w
+        INNER JOIN #ProjectedProduction p ON
+            w.NDC = p.NDC
+            AND w.Procedure_Code = p.Procedure_Code
+            AND w.Effective_Date <> p.Effective_Date  -- Different effective dates
+        WHERE w.Validation_Error IS NULL
+            AND (
+                -- New starts during existing period
+                (w. Effective_Date >= p.Effective_Date 
+                    AND (p.Ineffective_Date IS NULL OR w.Effective_Date <= p.Ineffective_Date))
+                OR
+                -- New ends during existing period
+                (w. Ineffective_Date IS NOT NULL 
+                    AND w.Ineffective_Date >= p.Effective_Date
+                    AND (p.Ineffective_Date IS NULL OR w. Ineffective_Date <= p.Ineffective_Date))
+                OR
+                -- New encompasses existing
+                (w.Effective_Date <= p.Effective_Date
+                    AND (w.Ineffective_Date IS NULL OR w.Ineffective_Date >= p.Effective_Date))
+            );
+        
+        -- Mark overlaps with error
+        UPDATE w
+        SET Validation_Error = 'Reject 13/14: OVERLAP'
+        FROM #WorkingData w
+        WHERE Validation_Error IS NULL
+            AND EXISTS (
+                SELECT 1
+                FROM dbo.NDC_Xwalk_Process_Log log
+                WHERE log.File_Date = @FileDate
+                    AND log.Error_Code = 'Reject 13/14'
+                    AND log.NDC = w.NDC
+                    AND log.Procedure_Code = w.Procedure_Code
+                    AND log.Effective_Date = w.Effective_Date
+            );
+        
+        -- =====================================================
+        -- STEP 6: Group Rejection Rule (Rule 5)
+        -- =====================================================
+        
+        -- Find groups with errors
+        IF OBJECT_ID('tempdb..#ErrorGroups') IS NOT NULL DROP TABLE #ErrorGroups;
+        
+        SELECT DISTINCT NDC, Procedure_Code
+        INTO #ErrorGroups
+        FROM #WorkingData
+        WHERE Validation_Error IS NOT NULL;
+        
+        -- Reject all records in error groups
+        UPDATE w
+        SET Validation_Error = 'GROUP_REJECTION'
+        FROM #WorkingData w
+        INNER JOIN #ErrorGroups eg ON w.NDC = eg.NDC AND w.Procedure_Code = eg.Procedure_Code
+        WHERE w.Validation_Error IS NULL;
+        
+        INSERT INTO dbo.NDC_Xwalk_Process_Log (
+            File_Date, NDC, Procedure_Code, Effective_Date, Ineffective_Date,
+            Log_Type, Error_Code, Message, Action_Taken
+        )
+        SELECT 
+            @FileDate,
+            NDC,
+            Procedure_Code,
+            Effective_Date,
+            Ineffective_Date,
+            'ERROR',
+            'GROUP_REJECTION',
+            'Rejected due to group rejection rule (Rule 5)',
+            'REJECTED'
+        FROM #WorkingData
+        WHERE Validation_Error = 'GROUP_REJECTION';
+        
+        DECLARE @GroupRejected INT = @@ROWCOUNT;
+        SET @RejectedRecords = @RejectedRecords + @GroupRejected;
+        
+        PRINT 'Group rejection additional errors: ' + CAST(@GroupRejected AS VARCHAR);
+        PRINT 'Total rejected records: ' + CAST(@RejectedRecords AS VARCHAR);
+        
+        INSERT INTO dbo.NDC_Xwalk_Process_Log (
+            File_Date, NDC, Procedure_Code, Effective_Date, Ineffective_Date,
+            Log_Type, Error_Code, Message, Action_Taken
+        )
+        SELECT 
+            @FileDate,
+            w.NDC,
+            w.Procedure_Code,
+            w.Effective_Date,
+            w.Ineffective_Date,
+            'WARNING',
+            'Warning 15',
+            'RETRO RECORD: Ineffective date (' + CONVERT(VARCHAR, w.Ineffective_Date, 23) + 
+                ') earlier than existing effective date (' + CONVERT(VARCHAR, p.Effective_Date, 23) + ')',
+            'WILL_INSERT'
+        FROM #WorkingData w
+        INNER JOIN dbo.Procedure_NDC_Xwalk p ON
+            w.NDC = p.NDC
+            AND w.Procedure_Code = p.Procedure_Code
+        WHERE w.Validation_Error IS NULL
+            AND w.Ineffective_Date IS NOT NULL
+            AND w. Ineffective_Date < p. Effective_Date
+            AND NOT EXISTS (
+                -- Ensure no overlap
+                SELECT 1
+                FROM dbo. Procedure_NDC_Xwalk p2
+                WHERE p2.NDC = w.NDC
+                    AND p2.Procedure_Code = w.Procedure_Code
+                    AND (
+                        (w.Effective_Date >= p2.Effective_Date 
+                            AND (p2.Ineffective_Date IS NULL OR w.Effective_Date <= p2.Ineffective_Date))
+                        OR
+                        (w.Ineffective_Date >= p2.Effective_Date
+                            AND (p2.Ineffective_Date IS NULL OR w.Ineffective_Date <= p2.Ineffective_Date))
+                    )
+            );
+        
+        SET @WarningRecords = @@ROWCOUNT;
+        PRINT 'Warnings detected: ' + CAST(@WarningRecords AS VARCHAR);
+        
+        -- =====================================================
+        -- STEP 8: Sort and Process Valid Records (Rule 3 & 4)
+        -- =====================================================
+        
+        PRINT 'Processing valid records...';
+        
+        -- Create sorted cursor for processing (oldest first)
+        DECLARE @NDC VARCHAR(11), @ProcCode VARCHAR(5), @NOC CHAR(1);
+        DECLARE @DrugName VARCHAR(255), @RCDesc VARCHAR(512);
+        DECLARE @EffDate DATE, @IneffDate DATE;
+        DECLARE @BillUnits DECIMAL(12,6), @BillUnitsPkg DECIMAL(12,6);
+        DECLARE @PkgSize DECIMAL(12,6), @PkgQty INT;
+        DECLARE @UOM VARCHAR(10), @PkgUOM VARCHAR(20);
+        DECLARE @FileDate_Value DATE;
+        DECLARE @ExistingIneff DATE;
+        
+        DECLARE process_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT 
+                NDC, DRUG_NAME, Procedure_Code, RC_DESC, NOC_Indicator, 
+                Effective_Date, Ineffective_Date,
+                BILL_UNITS, BILL_UNITS_PER_PKG, PKG_SIZE, PKG_QTY,
+                UOM, PKG_UOM, File_Date
+            FROM #WorkingData
+            WHERE Validation_Error IS NULL
+            ORDER BY Procedure_Code, NDC, Effective_Date;  -- Rule 3: Sort by Proc, NDC, Eff Date
+        
+        OPEN process_cursor;
+        FETCH NEXT FROM process_cursor INTO 
+            @NDC, @DrugName, @ProcCode, @RCDesc, @NOC, 
+            @EffDate, @IneffDate,
+            @BillUnits, @BillUnitsPkg, @PkgSize, @PkgQty,
+            @UOM, @PkgUOM, @FileDate_Value;
+        
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            
+            -- =====================================================
+            -- NEW:  Check for ATTEMPT TO UPDATE CLOSED RECORD
+            -- =====================================================
+            
+            SET @ExistingIneff = NULL;
+            
+            SELECT @ExistingIneff = Ineffective_Date
+            FROM dbo.Procedure_NDC_Xwalk
+            WHERE NDC = @NDC
+                AND Procedure_Code = @ProcCode
+                AND Effective_Date = @EffDate;
+            
+            -- If record exists and already has ineffective date
+            IF @ExistingIneff IS NOT NULL 
+                AND @IneffDate IS NOT NULL 
+                AND @IneffDate <> @ExistingIneff
+            BEGIN
+	    	-- Log error:  Attempting to update closed record
+                INSERT INTO dbo.NDC_Xwalk_Process_Log (
+                    File_Date, NDC, Procedure_Code, Effective_Date, Ineffective_Date,
+                    Log_Type, Error_Code, Message, Action_Taken
+                )
+                VALUES (
+                    @FileDate, 
+                    @NDC, 
+                    @ProcCode, 
+                    @EffDate, 
+                    @IneffDate,
+                    'ERROR', 
+                    'CLOSED_RECORD',
+                    'ATTEMPT TO UPDATE CLOSED RECORD: Existing Ineff=' + CONVERT(VARCHAR, @ExistingIneff, 23) + 
+                    ', New Ineff=' + CONVERT(VARCHAR, @IneffDate, 23),
+                    'REJECTED'
+                );
+                
+                SET @RejectedRecords = @RejectedRecords + 1;
+		-- Skip to next record
+                FETCH NEXT FROM process_cursor INTO 
+                    @NDC, @DrugName, @ProcCode, @RCDesc, @NOC, 
+                    @EffDate, @IneffDate,
+                    @BillUnits, @BillUnitsPkg, @PkgSize, @PkgQty,
+                    @UOM, @PkgUOM, @FileDate_Value;
+                CONTINUE;
+            END
+            
+            -- =====================================================
+            -- Check if record exists
+            -- =====================================================
+            
+            IF EXISTS (
+                SELECT 1 
+                FROM dbo.Procedure_NDC_Xwalk 
+                WHERE NDC = @NDC 
+                    AND Procedure_Code = @ProcCode 
+                    AND Effective_Date = @EffDate
+            )
+            BEGIN
+                -- =====================================================
+                -- FIX 1: ALWAYS UPDATE ALL FIELDS (no ISNULL logic)
+                -- =====================================================
+                UPDATE dbo.Procedure_NDC_Xwalk
+                SET 
+                    DRUG_NAME = @DrugName,
+                    RC_DESC = @RCDesc,
+                    NOC_Indicator = @NOC,
+                    Ineffective_Date = @IneffDate,
+                    BILL_UNITS = @BillUnits,
+                    BILL_UNITS_PER_PKG = @BillUnitsPkg,
+                    PKG_SIZE = @PkgSize,
+                    PKG_QTY = @PkgQty,
+                    UOM = @UOM,
+                    PKG_UOM = @PkgUOM,
+                    [User_ID] = SYSTEM_USER,
+                    DLU = GETDATE(),
+                    File_Date = @FileDate_Value
+                WHERE NDC = @NDC
+                    AND Procedure_Code = @ProcCode
+                    AND Effective_Date = @EffDate;
+                    -- NO condition - ALWAYS execute UPDATE
+                
+                SET @UpdatedRecords = @UpdatedRecords + 1;
+                
+                INSERT INTO dbo.NDC_Xwalk_Process_Log (
+                    File_Date, NDC, Procedure_Code, Effective_Date, Ineffective_Date,
+                    Log_Type, Message, Action_Taken
+                )
+                VALUES (@FileDate, @NDC, @ProcCode, @EffDate, @IneffDate, 'INFO', 'Record updated', 'UPDATED');
+            END
+            ELSE
+            BEGIN
+                -- INSERT with ALL FIELDS
+                INSERT INTO dbo.Procedure_NDC_Xwalk (
+                    NDC, DRUG_NAME, Procedure_Code, RC_DESC, NOC_Indicator, 
+                    Effective_Date, Ineffective_Date,
+                    BILL_UNITS, BILL_UNITS_PER_PKG, PKG_SIZE, PKG_QTY,
+                    UOM, PKG_UOM,
+                    [User_ID], DLU, File_Date
+                )
+                VALUES (
+                    @NDC, @DrugName, @ProcCode, @RCDesc, @NOC, 
+                    @EffDate, @IneffDate,
+                    @BillUnits, @BillUnitsPkg, @PkgSize, @PkgQty,
+                    @UOM, @PkgUOM,
+                    SYSTEM_USER, GETDATE(), @FileDate_Value
+                );
+                
+                SET @InsertedRecords = @InsertedRecords + 1;
+                
+                INSERT INTO dbo.NDC_Xwalk_Process_Log (
+                    File_Date, NDC, Procedure_Code, Effective_Date, Ineffective_Date,
+                    Log_Type, Message, Action_Taken
+                )
+                VALUES (@FileDate, @NDC, @ProcCode, @EffDate, @IneffDate, 'INFO', 'New record inserted', 'INSERTED');
+            END
+            
+            FETCH NEXT FROM process_cursor INTO 
+                @NDC, @DrugName, @ProcCode, @RCDesc, @NOC, 
+                @EffDate, @IneffDate,
+                @BillUnits, @BillUnitsPkg, @PkgSize, @PkgQty,
+                @UOM, @PkgUOM, @FileDate_Value;
+        END
+        
+        CLOSE process_cursor;
+        DEALLOCATE process_cursor;
+        
+        -- =====================================================
+        -- FINAL SUMMARY
+        -- =====================================================
+        
+        PRINT '============================================================';
+        PRINT 'PROCESSING COMPLETED';
+        PRINT 'Total Records in File: ' + CAST(@TotalRecords AS VARCHAR);
+        PRINT 'Excluded (RMV_DATE < 2014-01-01): ' + CAST(@ExcludedRecords AS VARCHAR);
+        PRINT 'Processed: ' + CAST(@TotalRecords - @ExcludedRecords AS VARCHAR);
+        PRINT 'Inserted: ' + CAST(@InsertedRecords AS VARCHAR);
+        PRINT 'Updated: ' + CAST(@UpdatedRecords AS VARCHAR);
+        PRINT 'Rejected: ' + CAST(@RejectedRecords AS VARCHAR);
+        PRINT 'Warnings: ' + CAST(@WarningRecords AS VARCHAR);
+        PRINT 'Duration: ' + CAST(DATEDIFF(SECOND, @StartTime, GETDATE()) AS VARCHAR) + ' seconds';
+        PRINT '============================================================';
+        
+        -- Return summary
+        SELECT 
+            @FileDate AS File_Date,
+            @TotalRecords AS Total_Records_In_File,
+            @ExcludedRecords AS Excluded_Pre2014,
+            @InsertedRecords AS Inserted,
+            @UpdatedRecords AS Updated,
+            @RejectedRecords AS Rejected,
+            @WarningRecords AS Warnings,
+            DATEDIFF(SECOND, @StartTime, GETDATE()) AS Duration_Seconds;
+        
+        -- Cleanup
+        DROP TABLE #WorkingData;
+        DROP TABLE #ErrorGroups;
+        DROP TABLE #ProjectedProduction;
+        
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH
+    
+END;
+GO
+
+
